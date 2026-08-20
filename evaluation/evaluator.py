@@ -97,39 +97,31 @@ def evaluate(
     acc = MetricAccumulator(k_values=k_values)
 
     for batch in test_loader:
-        input_ids    = batch["input_ids"].to(device)     # [B, L]
-        labels       = batch["labels"].to(device)        # [B, L]  (-100 except target)
-        padding_mask = batch["padding_mask"].to(device)  # [B, L]
+        input_ids = batch["input_ids"].to(device)
+        labels = batch["labels"].to(device)
+        padding_mask = batch["padding_mask"].to(device)
+        genres = batch["genres"].to(device) if "genres" in batch else None
+        decade = batch["decade"].to(device) if "decade" in batch else None
 
-        # ── Forward pass ──────────────────────────────────────────────────
-        logits = model(input_ids, padding_mask)          # [B, L, V]
+        logits = model(input_ids, padding_mask, genres=genres, decade=decade)
 
         B, L, V = logits.shape
 
-        # ── Find the masked (target) position per user ─────────────────────
-        # labels != -100 at exactly one position per sequence (the target)
-        target_pos = (labels != -100).long().argmax(dim=1)       # [B]
-        target_ids = labels[torch.arange(B, device=device), target_pos]  # [B]
+        target_pos = (labels != -100).long().argmax(dim=1)
+        target_ids = labels[torch.arange(B, device=device), target_pos]
 
-        # ── Extract logits at the target position ─────────────────────────
-        idx           = target_pos.view(B, 1, 1).expand(B, 1, V)
-        target_logits = logits.gather(1, idx).squeeze(1)          # [B, V]
+        idx = target_pos.view(B, 1, 1).expand(B, 1, V)
+        target_logits = logits.gather(1, idx).squeeze(1)
 
-        # ── Filter seen items ─────────────────────────────────────────────
-        # Set logit = -inf for any item already in the user's input sequence
-        # (excluding PAD=0 and MASK=mask_token_id)
         for b in range(B):
             seen = input_ids[b]
             seen = seen[(seen != 0) & (seen != mask_token_id)]
             target_logits[b, seen] = float("-inf")
 
-        # ── Rank all items ────────────────────────────────────────────────
-        # argsort descending → ranked list of item ids
-        ranked = torch.argsort(target_logits, dim=-1, descending=True)  # [B, V]
+        ranked = torch.argsort(target_logits, dim=-1, descending=True)
 
-        # ── Accumulate metrics ────────────────────────────────────────────
         ranked_lists = ranked.cpu().tolist()
-        target_list  = target_ids.cpu().tolist()
+        target_list = target_ids.cpu().tolist()
         acc.update(ranked_lists, target_list)
 
     return acc.compute()
@@ -158,23 +150,40 @@ def run_evaluation(
     model, cfg = load_model_from_checkpoint(checkpoint_path, device)
 
     # ── Data ──────────────────────────────────────────────────────────────
-    data_dir  = Path(data_dir)
-    proc_dir  = data_dir / "processed"
+    data_dir = Path(data_dir)
+    proc_dir = data_dir / "processed"
 
-    test_seqs  = joblib.load(proc_dir / "test_seqs.pkl")
-    item_enc   = joblib.load(proc_dir / "item_encoder.pkl")
-    stats      = json.loads((proc_dir / "stats.json").read_text())
+    test_seqs = joblib.load(proc_dir / "test_seqs.pkl")
+    item_enc = joblib.load(proc_dir / "item_encoder.pkl")
+    stats = json.loads((proc_dir / "stats.json").read_text())
 
-    num_items     = stats["num_items"]
-    mask_token_id = stats["vocab_size"] - 1   # num_items + 1
+    num_items = stats["num_items"]
+    mask_token_id = stats["vocab_size"] - 1
+
+    # ── Load side features if the model was trained with them ──
+    use_features = cfg.get("use_features", False) or bool(cfg.get("num_genres", 0))
+    item_features = None
+    num_genres = num_decades = 0
+    if use_features:
+        feat_path = proc_dir / "item_features.pkl"
+        if feat_path.exists():
+            item_features = joblib.load(feat_path)
+            num_genres = stats["num_genres"]
+            num_decades = stats["num_decades"]
+            logger.info("Loaded side features for evaluation (genres=%d, decades=%d)",
+                        num_genres, num_decades)
 
     test_ds = BERT4RecDataset(
-        sequences   = test_seqs,
-        num_items   = num_items,
-        max_seq_len = cfg.get("max_seq_len", 200),
-        mask_prob   = cfg.get("mask_prob",   0.2),
-        split       = Split.TEST,
+        sequences=test_seqs,
+        num_items=num_items,
+        max_seq_len=cfg.get("max_seq_len", 200),
+        mask_prob=cfg.get("mask_prob", 0.2),
+        split=Split.TEST,
+        item_features=item_features,
+        num_genres=num_genres,
+        num_decades=num_decades,
     )
+
     test_loader = DataLoader(
         test_ds,
         batch_size  = batch_size,

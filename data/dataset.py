@@ -73,6 +73,9 @@ class BERT4RecDataset(Dataset):
         mask_prob:   float = 0.2,
         split:       Split = Split.TRAIN,
         seed:        int   = 42,
+        item_features: dict[int, dict] | None = None,
+        num_genres: int = 0,
+        num_decades: int = 0,
     ) -> None:
         self.sequences   = list(sequences.values())
         self.user_ids    = list(sequences.keys())
@@ -82,6 +85,22 @@ class BERT4RecDataset(Dataset):
         self.split       = split
         self.mask_id     = num_items + 1   # [MASK] token id
         self._rng        = random.Random(seed)
+
+        # ── side features ──
+        self.item_features = item_features
+        self.num_genres = num_genres
+        self.num_decades = num_decades
+
+        # Pre-build lookup tables for fast indexing.
+        # Row 0 is reserved for PAD / MASK (all zeros).
+        # Rows 1..num_items+1 hold real item features; row mask_id stays zero too.
+        if item_features is not None:
+            table_size = num_items + 2  # PAD + items + MASK
+            self._genre_table = torch.zeros(table_size, num_genres, dtype=torch.float)
+            self._decade_table = torch.zeros(table_size, dtype=torch.long)
+            for item_id, feats in item_features.items():
+                self._genre_table[item_id] = torch.tensor(feats["genres"], dtype=torch.float)
+                self._decade_table[item_id] = feats["decade"]
 
     # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -147,14 +166,21 @@ class BERT4RecDataset(Dataset):
 
         input_ids_t  = torch.tensor(input_ids, dtype=torch.long)
         labels_t     = torch.tensor(labels,    dtype=torch.long)
-        padding_mask = (input_ids_t == PAD_ID)   # True where padded
+        padding_mask = (input_ids_t == PAD_ID)
 
-        return {
+        out = {
             "input_ids":    input_ids_t,
             "labels":       labels_t,
             "padding_mask": padding_mask,
             "user_id":      torch.tensor(self.user_ids[idx], dtype=torch.long),
         }
+
+        # ── side features (look up by input_ids) ──
+        if self.item_features is not None:
+            out["genres"] = self._genre_table[input_ids_t]    # [L, num_genres]
+            out["decade"] = self._decade_table[input_ids_t]   # [L]
+
+        return out
 
 
 # ── DataLoader factory ─────────────────────────────────────────────────────────
@@ -166,58 +192,60 @@ def build_dataloaders(
     batch_size:    int   = 256,
     num_workers:   int   = 4,
     seed:          int   = 42,
+    use_features:  bool  = True,
 ) -> tuple[DataLoader, DataLoader, DataLoader, dict[str, Any]]:
-    """
-    Load preprocessed sequences and return (train_loader, val_loader,
-    test_loader, stats) ready for training.
-
-    Args:
-        processed_dir:  path to data/processed/ (output of preprocess.py).
-        max_seq_len:    maximum sequence length; truncates + left-pads.
-        mask_prob:      masking probability used during training.
-        batch_size:     samples per mini-batch.
-        num_workers:    DataLoader worker processes.
-        seed:           reproducibility seed.
-
-    Returns:
-        train_loader, val_loader, test_loader, stats dict.
-    """
     processed_dir = Path(processed_dir)
 
-    # ── load sequences ──
-    train_seqs: dict[int, list[int]] = joblib.load(processed_dir / "train_seqs.pkl")
-    val_seqs:   dict[int, list[int]] = joblib.load(processed_dir / "val_seqs.pkl")
-    test_seqs:  dict[int, list[int]] = joblib.load(processed_dir / "test_seqs.pkl")
-    item_enc                         = joblib.load(processed_dir / "item_encoder.pkl")
+    train_seqs = joblib.load(processed_dir / "train_seqs.pkl")
+    val_seqs   = joblib.load(processed_dir / "val_seqs.pkl")
+    test_seqs  = joblib.load(processed_dir / "test_seqs.pkl")
+    item_enc   = joblib.load(processed_dir / "item_encoder.pkl")
 
-    num_items = len(item_enc.classes_)   # does NOT include PAD or MASK
+    num_items = len(item_enc.classes_)
 
-    common = dict(num_items=num_items, max_seq_len=max_seq_len, seed=seed)
+    # ── Side features (optional) ──
+    item_features = None
+    num_genres    = 0
+    num_decades   = 0
+    if use_features:
+        feat_path = processed_dir / "item_features.pkl"
+        if feat_path.exists():
+            item_features = joblib.load(feat_path)
+            import json
+            stats_json = json.loads((processed_dir / "stats.json").read_text())
+            num_genres  = stats_json["num_genres"]
+            num_decades = stats_json["num_decades"]
+
+    common = dict(
+        num_items     = num_items,
+        max_seq_len   = max_seq_len,
+        seed          = seed,
+        item_features = item_features,
+        num_genres    = num_genres,
+        num_decades   = num_decades,
+    )
 
     train_ds = BERT4RecDataset(train_seqs, mask_prob=mask_prob, split=Split.TRAIN, **common)
     val_ds   = BERT4RecDataset(val_seqs,   mask_prob=mask_prob, split=Split.VAL,   **common)
     test_ds  = BERT4RecDataset(test_seqs,  mask_prob=mask_prob, split=Split.TEST,  **common)
 
-    loader_kwargs = dict(
-        batch_size  = batch_size,
-        num_workers = num_workers,
-        pin_memory  = True,
-    )
-
+    loader_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
     train_loader = DataLoader(train_ds, shuffle=True,  **loader_kwargs)
     val_loader   = DataLoader(val_ds,   shuffle=False, **loader_kwargs)
     test_loader  = DataLoader(test_ds,  shuffle=False, **loader_kwargs)
 
     stats = {
-        "num_items":    num_items,
-        "vocab_size":   num_items + 2,    # PAD + items + MASK
-        "mask_token_id": num_items + 1,
+        "num_items":       num_items,
+        "vocab_size":      num_items + 2,
+        "mask_token_id":   num_items + 1,
         "num_train_users": len(train_seqs),
         "num_val_users":   len(val_seqs),
         "num_test_users":  len(test_seqs),
         "train_batches":   len(train_loader),
+        "num_genres":      num_genres,
+        "num_decades":     num_decades,
+        "use_features":    item_features is not None,
     }
-
     return train_loader, val_loader, test_loader, stats
 
 
@@ -260,3 +288,8 @@ if __name__ == "__main__":
 
     print(f"\n  [MASK] covers {mask_ratio:.1%} of labelled positions (expect ~80%)")
     print("\n  Smoke-test passed ✓")
+
+    print(f"\n  genres shape: {batch['genres'].shape}")  # 应该是 [256, 200, 18]
+    print(f"  decade shape: {batch['decade'].shape}")  # 应该是 [256, 200]
+    print(f"  genres at PAD pos: {batch['genres'][0, 0]}")  # 全 0
+    print(f"  genres at real pos: {batch['genres'][0, -1]}")  # 非全 0（除非最后是 MASK）

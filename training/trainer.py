@@ -122,16 +122,19 @@ def train_epoch(
     t0         = time.time()
 
     for batch in loader:
-        input_ids    = batch["input_ids"].to(device)     # [B, L]
-        labels       = batch["labels"].to(device)        # [B, L]
-        padding_mask = batch["padding_mask"].to(device)  # [B, L] bool
+        input_ids = batch["input_ids"].to(device)
+        labels = batch["labels"].to(device)
+        padding_mask = batch["padding_mask"].to(device)
+
+        # side features (optional)
+        genres = batch["genres"].to(device) if "genres" in batch else None
+        decade = batch["decade"].to(device) if "decade" in batch else None
 
         optimizer.zero_grad(set_to_none=True)
 
-        # ── Forward (with optional AMP) ───────────────────────────────────
         if use_amp:
             with autocast():
-                logits = model(input_ids, padding_mask)
+                logits = model(input_ids, padding_mask, genres=genres, decade=decade)
                 loss, metrics = criterion(logits, labels)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -139,7 +142,7 @@ def train_epoch(
             scaler.step(optimizer)
             scaler.update()
         else:
-            logits = model(input_ids, padding_mask)
+            logits = model(input_ids, padding_mask, genres=genres, decade=decade)
             loss, metrics = criterion(logits, labels)
             loss.backward()
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -149,14 +152,13 @@ def train_epoch(
         global_step += 1
 
         total_loss += metrics["loss"]
-        n_batches  += 1
+        n_batches += 1
 
-        # ── Per-step TensorBoard logging ──────────────────────────────────
         lr = scheduler.get_last_lr()[0]
-        writer.add_scalar("train/loss",      metrics["loss"], global_step)
-        writer.add_scalar("train/ppl",       metrics["ppl"],  global_step)
-        writer.add_scalar("train/lr",        lr,              global_step)
-        writer.add_scalar("train/grad_norm", grad_norm,       global_step)
+        writer.add_scalar("train/loss", metrics["loss"], global_step)
+        writer.add_scalar("train/ppl", metrics["ppl"], global_step)
+        writer.add_scalar("train/lr", lr, global_step)
+        writer.add_scalar("train/grad_norm", grad_norm, global_step)
 
         if global_step % 50 == 0:
             acc = masked_accuracy(logits.detach(), labels)
@@ -194,17 +196,19 @@ def validate(
     n_batches  = 0
 
     for batch in loader:
-        input_ids    = batch["input_ids"].to(device)
-        labels       = batch["labels"].to(device)
+        input_ids = batch["input_ids"].to(device)
+        labels = batch["labels"].to(device)
         padding_mask = batch["padding_mask"].to(device)
+        genres = batch["genres"].to(device) if "genres" in batch else None
+        decade = batch["decade"].to(device) if "decade" in batch else None
 
-        logits = model(input_ids, padding_mask)
+        logits = model(input_ids, padding_mask, genres=genres, decade=decade)
         _, metrics = criterion(logits, labels)
         acc = masked_accuracy(logits, labels)
 
         total_loss += metrics["loss"]
-        total_acc  += acc
-        n_batches  += 1
+        total_acc += acc
+        n_batches += 1
 
     mean_loss = total_loss / max(n_batches, 1)
     mean_acc  = total_acc  / max(n_batches, 1)
@@ -254,12 +258,18 @@ def train(cfg: dict) -> None:
         batch_size    = cfg["batch_size"],
         num_workers   = cfg["num_workers"],
         seed          = cfg.get("seed", 42),
+        use_features=cfg.get("use_features", False),
     )
     logger.info("Dataset: %s", stats)
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model_cfg = {**cfg, "vocab_size": stats["vocab_size"]}
-    model     = build_model(model_cfg).to(device)
+    model_cfg = {
+        **cfg,
+        "vocab_size": stats["vocab_size"],
+        "num_genres": stats.get("num_genres", 0),
+        "num_decades": stats.get("num_decades", 0),
+    }
+    model = build_model(model_cfg).to(device)
     logger.info("Model parameters: %s", f"{model.num_parameters():,}")
 
     # ── Loss, optimiser, scheduler ────────────────────────────────────────────
@@ -386,6 +396,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--mask_prob",   type=float, default=0.2)
     p.add_argument("--num_workers", type=int,   default=0,
                    help="0 is safest on macOS / MPS")
+    p.add_argument("--use_features", action="store_true",
+                   help="Enable multi-feature embedding (genres + decade)")
 
     # Model
     p.add_argument("--hidden_size",             type=int,   default=256)

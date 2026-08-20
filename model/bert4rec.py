@@ -75,6 +75,8 @@ class BERT4Rec(nn.Module):
         hidden_dropout_prob:       float = 0.1,
         attention_probs_dropout:   float = 0.1,
         pad_token_id:              int   = 0,
+        num_genres:                int = 0,
+        num_decades:               int = 0,
     ) -> None:
         super().__init__()
 
@@ -84,11 +86,13 @@ class BERT4Rec(nn.Module):
 
         # ── 1. Embedding layer ───────────────────────────────────────────────
         self.embeddings = BERTEmbeddings(
-            vocab_size   = vocab_size,
-            hidden_size  = hidden_size,
-            max_seq_len  = max_seq_len,
-            dropout      = hidden_dropout_prob,
-            pad_token_id = pad_token_id,
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            max_seq_len=max_seq_len,
+            dropout=hidden_dropout_prob,
+            pad_token_id=pad_token_id,
+            num_genres=num_genres,
+            num_decades=num_decades,
         )
 
         # ── 2. Transformer stack ─────────────────────────────────────────────
@@ -127,6 +131,8 @@ class BERT4Rec(nn.Module):
         self,
         input_ids:    Tensor,
         padding_mask: Tensor | None = None,
+        genres:       Tensor | None = None,
+        decade:       Tensor | None = None,
     ) -> Tensor:
         """
         Full forward pass used during training.
@@ -145,7 +151,7 @@ class BERT4Rec(nn.Module):
             padding_mask = (input_ids == self.pad_token_id)   # [B, L]
 
         # ── Embeddings ───────────────────────────────────────────────────────
-        x = self.embeddings(input_ids)         # [B, L, d]
+        x = self.embeddings(input_ids, genres=genres, decade=decade)         # [B, L, d]
 
         # ── Transformer layers ───────────────────────────────────────────────
         for block in self.transformer_blocks:
@@ -251,6 +257,8 @@ def build_model(cfg) -> BERT4Rec:
         hidden_dropout_prob      = get("hidden_dropout_prob",     0.1),
         attention_probs_dropout  = get("attention_probs_dropout", 0.1),
         pad_token_id             = get("pad_token_id",            0),
+        num_genres               =get("num_genres",               0),
+        num_decades              =get("num_decades",              0),
     )
 
 

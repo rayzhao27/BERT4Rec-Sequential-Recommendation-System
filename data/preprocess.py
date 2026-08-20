@@ -27,6 +27,7 @@ Output files (inside --data_dir/processed/):
 """
 from __future__ import annotations
 
+import re
 import argparse
 import json
 import logging
@@ -70,6 +71,82 @@ def load_ratings(raw_dir: Path, min_rating: float = 4.0) -> pd.DataFrame:
 
     return df
 
+def build_item_features(
+    raw_dir: Path,
+    item_enc: LabelEncoder,
+) -> tuple[dict[int, dict], dict]:
+    """
+    Build side features for each item from movies.dat.
+
+    Returns:
+        item_features: dict mapping encoded_item_id (1-based) → {
+            "genres":  list[int]  multi-hot vector
+            "decade":  int        decade bucket id
+        }
+        feature_stats: dict with num_genres, num_decades, etc.
+    """
+    logger.info("Building item side features …")
+
+    # ── 1. Load raw movies metadata ──
+    movies = load_movies(raw_dir)
+
+    # ── 2. Build genre vocabulary ──
+    all_genres = sorted(set(
+        g for genre_str in movies["genres"]
+        for g in genre_str.split("|")
+    ))
+    genre_to_idx = {g: i for i, g in enumerate(all_genres)}
+    num_genres = len(all_genres)
+    logger.info("  genres: %d → %s", num_genres, all_genres)
+
+    # ── 3. Parse year from title and bucket into decades ──
+    def extract_year(title: str) -> int:
+        m = re.search(r"\((\d{4})\)", title)
+        return int(m.group(1)) if m else 1990   # fallback
+
+    movies["year"]   = movies["title"].apply(extract_year)
+    movies["decade"] = (movies["year"] - 1900) // 10   # e.g. 1995 → 9
+
+    all_decades = sorted(movies["decade"].unique())
+    decade_to_idx = {d: i for i, d in enumerate(all_decades)}
+    num_decades = len(all_decades)
+    logger.info("  decades: %d → %s", num_decades, all_decades)
+
+    # ── 4. Build mapping: raw_item_id → encoded_item_id (1-based) ──
+    # item_enc was fitted on raw item ids; encoded = item_enc.transform([raw]) + 1
+    valid_raw_ids = set(item_enc.classes_)
+
+    # ── 5. Construct features for every item that survived filtering ──
+    item_features: dict[int, dict] = {}
+
+    for _, row in movies.iterrows():
+        raw_id = row["item_id"]
+        if raw_id not in valid_raw_ids:
+            continue   # this movie had no high-rating interactions
+
+        encoded_id = int(item_enc.transform([raw_id])[0]) + 1   # 1-based
+
+        # multi-hot genre vector
+        genres_multihot = [0] * num_genres
+        for g in row["genres"].split("|"):
+            genres_multihot[genre_to_idx[g]] = 1
+
+        item_features[encoded_id] = {
+            "genres": genres_multihot,
+            "decade": decade_to_idx[row["decade"]],
+        }
+
+    logger.info("  built features for %d items", len(item_features))
+
+    # ── 6. Stats ──
+    feature_stats = {
+        "num_genres":    num_genres,
+        "num_decades":   num_decades,
+        "genre_vocab":   all_genres,
+        "decade_vocab":  [int(d) for d in all_decades],
+    }
+
+    return item_features, feature_stats
 
 def load_movies(raw_dir: Path) -> pd.DataFrame:
     """Parse movies.dat.  Returns DataFrame with [item_id, title, genres]."""
@@ -209,9 +286,16 @@ def preprocess(
 
     # ── 5. Stats ──
     stats = compute_stats(sequences, item_enc)
-    logger.info("Dataset stats: %s", json.dumps(stats, indent=2))
+
+    # ── 5.5 Side features ──
+    item_features, feature_stats = build_item_features(raw_dir, item_enc)
+    stats.update(feature_stats)
+    logger.info("Dataset stats: %s", json.dumps(
+        {k: v for k, v in stats.items() if not isinstance(v, list)}, indent=2
+    ))
 
     # ── 6. Save ──
+    joblib.dump(item_features, proc_dir / "item_features.pkl")
     joblib.dump(train_seqs, proc_dir / "train_seqs.pkl")
     joblib.dump(val_seqs,   proc_dir / "val_seqs.pkl")
     joblib.dump(test_seqs,  proc_dir / "test_seqs.pkl")
