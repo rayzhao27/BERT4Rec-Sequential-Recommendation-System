@@ -56,9 +56,13 @@ def load_model_from_checkpoint(
 
     # cfg from trainer doesn't include vocab_size — load from stats
     data_dir  = Path(cfg["data_dir"])
-    stats     = json.loads((data_dir / "processed" / "stats.json").read_text())
-    #cfg["vocab_size"] = stats["vocab_size"]
+    stats = json.loads((data_dir / "processed" / "stats.json").read_text())
     cfg["vocab_size"] = stats["num_items"] + 2  # PAD + items + MASK
+
+    # If the checkpoint was trained with side features, restore those dims too
+    if cfg.get("use_features", False):
+        cfg["num_genres"] = stats["num_genres"]
+        cfg["num_decades"] = stats["num_decades"]
 
     model = build_model(cfg).to(device)
     model.load_state_dict(ckpt["model"])
