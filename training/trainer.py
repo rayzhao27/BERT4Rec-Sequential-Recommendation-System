@@ -270,6 +270,10 @@ def train(cfg: dict) -> None:
         "num_decades": stats.get("num_decades", 0),
     }
     model = build_model(model_cfg).to(device)
+
+    # Write feature dims back into cfg so checkpoints record them.
+    cfg["num_genres"] = model_cfg["num_genres"]
+    cfg["num_decades"] = model_cfg["num_decades"]
     logger.info("Model parameters: %s", f"{model.num_parameters():,}")
 
     # ── Loss, optimiser, scheduler ────────────────────────────────────────────
